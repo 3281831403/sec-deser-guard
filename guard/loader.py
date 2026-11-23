@@ -19,10 +19,158 @@ verify_signature 用布尔值表示签名是否正确外，其余拒绝行为统
 """
 
 import base64
+import hashlib
 import hmac
 import json
 import pickle
-import types
+
+_FIELDS = frozenset({"version", "encoding", "payload", "signature"})
+_EXECUTABLE_TYPE_NAMES = frozenset(
+    {
+        "function",
+        "builtin_function_or_method",
+        "method",
+        "type",
+        "code",
+        "frame",
+        "traceback",
+        "module",
+    }
+)
+_MAX_DEPTH_LIMIT = 32
+
+# 仅这些类型被视为“标量”，可以按原值返回。
+_SCALAR_TYPES = (
+    type(None),
+    bool,
+    int,
+    float,
+    complex,
+    str,
+    bytes,
+    bytearray,
+)
+_SCALAR_NAMES = frozenset(t.__name__ for t in _SCALAR_TYPES)
+
+
+def _allow_items(allow):
+    """把 allow 归一为 list[str]；非法时返回 None。
+
+    只迭代一次，避免生成器被多次消费后变成空集。
+    """
+    if isinstance(allow, (str, bytes)):
+        return None
+    try:
+        items = list(allow)
+    except TypeError:
+        return None
+    if not all(type(item) is str for item in items):
+        return None
+    return items
+
+
+def _snapshot_policy(policy):
+    """把可迭代的 allow 物化为 list，避免生成器被多次遍历后耗尽。
+
+    非法策略原样返回，交由 validate_policy 报告。
+    """
+    if type(policy) is not dict or "allow" not in policy:
+        return policy
+    items = _allow_items(policy["allow"])
+    if items is None:
+        return policy
+    snapshot = dict(policy)
+    snapshot["allow"] = items
+    return snapshot
+
+
+def _normalize_allow(allow) -> frozenset:
+    items = _allow_items(allow)
+    if items is None:
+        raise ValueError("allow 必须是类型名字符串的可迭代对象")
+    return frozenset(items)
+
+
+def _reject_constant(token):
+    raise ValueError(f"非法 JSON 常量: {token}")
+
+
+def _object_pairs(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError(f"重复字段: {key}")
+        obj[key] = value
+    return obj
+
+
+def _decode_envelope(blob):
+    """严格解码外层封装，返回 (规范化字典, payload 的 base64 原始字节)。
+
+    内部的 payload 是已解码的 bytes；原始字节保留给签名校验使用，因为签名
+    覆盖的是 payload 字段里 base64 ASCII 文本本身。
+    """
+    if isinstance(blob, bytes):
+        try:
+            text = blob.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("封装不是合法的 UTF-8 字节") from exc
+    elif isinstance(blob, str):
+        text = blob
+    else:
+        raise ValueError("封装必须是 UTF-8 JSON 的 bytes 或 str")
+
+    try:
+        fields = json.loads(
+            text,
+            object_pairs_hook=_object_pairs,
+            parse_constant=_reject_constant,
+        )
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("封装不是合法的 JSON") from exc
+
+    if type(fields) is not dict:
+        raise ValueError("封装顶层必须是一个 JSON 对象")
+    if set(fields) != _FIELDS:
+        raise ValueError("封装顶层字段必须且只能是 version、encoding、payload、signature")
+
+    version = fields["version"]
+    if type(version) is not int or version != 1:
+        raise ValueError("version 必须为整数 1")
+
+    encoding = fields["encoding"]
+    if type(encoding) is not str or encoding != "pickle":
+        raise ValueError("encoding 必须为字符串 pickle")
+
+    payload = fields["payload"]
+    if type(payload) is not str:
+        raise ValueError("payload 必须是 base64 ASCII 字符串")
+    try:
+        payload_b64 = payload.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("payload 必须是 base64 ASCII 字符串") from exc
+    try:
+        payload_bytes = base64.b64decode(payload_b64, validate=True)
+    except Exception as exc:
+        raise ValueError("payload 不是合法的 base64") from exc
+
+    signature = fields["signature"]
+    if (
+        type(signature) is not str
+        or len(signature) != 64
+        or any(ch not in "0123456789abcdef" for ch in signature)
+    ):
+        raise ValueError("signature 必须是 64 位小写十六进制字符串")
+
+    decoded = {
+        "version": 1,
+        "encoding": "pickle",
+        "payload": payload_bytes,
+        "signature": signature,
+    }
+    return decoded, payload_b64
 
 
 def decode_blob(blob) -> dict:
@@ -35,7 +183,8 @@ def decode_blob(blob) -> dict:
     进制，均视为格式非法并抛出 ValueError。此函数必须使用严格模式，不得静默
     忽略任何多余字段。
     """
-    raise NotImplementedError
+    decoded, _ = _decode_envelope(blob)
+    return decoded
 
 
 def verify_signature(blob, key) -> bool:
@@ -46,7 +195,12 @@ def verify_signature(blob, key) -> bool:
     hmac.compare_digest 做恒定时间比较，禁止使用普通等号。签名正确返回 True，
     签名错误返回 False；封装格式非法时抛出 ValueError。
     """
-    raise NotImplementedError
+    if type(key) is not bytes:
+        raise ValueError("key 必须是 bytes")
+
+    decoded, payload_b64 = _decode_envelope(blob)
+    expected = hmac.new(key, payload_b64, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, decoded["signature"])
 
 
 def type_allowed(value, allow) -> bool:
@@ -57,7 +211,26 @@ def type_allowed(value, allow) -> bool:
     容器本身和每个元素都允许。只要任意一层出现白名单外类型就返回 False，不能
     只检查最外层。可执行类型默认不在任何安全白名单内。
     """
-    raise NotImplementedError
+    allowed = _normalize_allow(allow)
+    if type(value) in _SCALAR_TYPES:
+        return type(value).__name__ in allowed
+    if type(value) is dict:
+        if "dict" not in allowed:
+            return False
+        return all(
+            type_allowed(k, allowed) and type_allowed(v, allowed)
+            for k, v in value.items()
+        )
+    if type(value) is list:
+        if "list" not in allowed:
+            return False
+        return all(type_allowed(item, allowed) for item in value)
+    if type(value) is tuple:
+        if "tuple" not in allowed:
+            return False
+        return all(type_allowed(item, allowed) for item in value)
+    # 任何其它类型（含可执行类型、自定义类实例等）一律不在白名单内。
+    return False
 
 
 def depth_ok(value, limit) -> bool:
@@ -68,7 +241,24 @@ def depth_ok(value, limit) -> bool:
     是非负整数，否则抛出 ValueError。必须同时统计字典和列表嵌套，不能只统计
     列表层数。
     """
-    raise NotImplementedError
+    if type(limit) is not int or limit < 0:
+        raise ValueError("limit 必须是非负整数")
+
+    def _within(node, remaining):
+        """remaining 为还能继续进入的容器层数。"""
+        if type(node) is dict:
+            if remaining <= 0:
+                return False
+            contents = list(node.keys()) + list(node.values())
+        elif type(node) in (list, tuple):
+            if remaining <= 0:
+                return False
+            contents = list(node)
+        else:
+            return True
+        return all(_within(child, remaining - 1) for child in contents)
+
+    return _within(value, limit)
 
 
 def safe_load(blob, policy, key) -> object:
@@ -81,7 +271,29 @@ def safe_load(blob, policy, key) -> object:
     环节失败都抛出 ValueError，且验签失败时绝不能触发任何 pickle 反序列化
     副作用。
     """
-    raise NotImplementedError
+    policy = _snapshot_policy(policy)
+    issues = validate_policy(policy)
+    if issues:
+        raise ValueError(f"策略非法: {issues}")
+    if type(key) is not bytes:
+        raise ValueError("key 必须是 bytes")
+
+    decoded, payload_b64 = _decode_envelope(blob)
+
+    expected = hmac.new(key, payload_b64, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, decoded["signature"]):
+        raise ValueError("签名校验失败")
+
+    try:
+        obj = pickle.loads(decoded["payload"])
+    except Exception as exc:
+        raise ValueError("payload 反序列化失败") from exc
+
+    if not depth_ok(obj, policy["max_depth"]):
+        raise ValueError("嵌套深度超过上限")
+    if not type_allowed(obj, policy["allow"]):
+        raise ValueError("类型不在白名单内")
+    return rebuild(obj, policy["allow"])
 
 
 def rebuild(value, allow) -> object:
@@ -92,7 +304,24 @@ def rebuild(value, allow) -> object:
     白名单外类型必须抛出 ValueError，绝不能把原值或危险对象原样返回。重建过程
     必须递归到每一层，不能只处理最外层。
     """
-    raise NotImplementedError
+    allowed = _normalize_allow(allow)
+    name = type(value).__name__
+
+    if type(value) is dict:
+        if "dict" not in allowed:
+            raise ValueError("dict 不在类型白名单内")
+        return {rebuild(k, allowed): rebuild(v, allowed) for k, v in value.items()}
+    if type(value) is list:
+        if "list" not in allowed:
+            raise ValueError("list 不在类型白名单内")
+        return [rebuild(item, allowed) for item in value]
+    if type(value) is tuple:
+        if "tuple" not in allowed:
+            raise ValueError("tuple 不在类型白名单内")
+        return tuple(rebuild(item, allowed) for item in value)
+    if name in _SCALAR_NAMES and name in allowed:
+        return value
+    raise ValueError(f"未知或不允许的类型: {name}")
 
 
 def validate_policy(policy) -> list[str]:
@@ -108,7 +337,34 @@ def validate_policy(policy) -> list[str]:
     invalid_policy 表示 policy 不是字典。必须检查是否强制验签，不能因为
     require_signature 缺失就当成已启用。
     """
-    raise NotImplementedError
+    if type(policy) is not dict:
+        return ["invalid_policy"]
+
+    issues = []
+
+    if "allow" not in policy:
+        issues.append("invalid_allowlist")
+    else:
+        allow = policy["allow"]
+        items = _allow_items(allow)
+        if items is None:
+            issues.append("invalid_allowlist")
+        elif set(items) & _EXECUTABLE_TYPE_NAMES:
+            issues.append("executable_type")
+
+    if "max_depth" not in policy:
+        issues.append("depth_limit_invalid")
+    else:
+        max_depth = policy["max_depth"]
+        if type(max_depth) is not int or max_depth < 0:
+            issues.append("depth_limit_invalid")
+        elif max_depth > _MAX_DEPTH_LIMIT:
+            issues.append("depth_limit_too_large")
+
+    if policy.get("require_signature") is not True:
+        issues.append("signature_not_required")
+
+    return issues
 
 
 def load_batch(blobs, policy, key) -> dict:
@@ -119,4 +375,15 @@ def load_batch(blobs, policy, key) -> dict:
     对应的字典：成功项的值是加载出的对象，失败项的值是该输入捕获到的异常
     实例。单个输入失败不得影响其它输入。
     """
-    raise NotImplementedError
+    policy = _snapshot_policy(policy)
+    issues = validate_policy(policy)
+    if issues:
+        raise ValueError(f"策略非法: {issues}")
+
+    results = {}
+    for label, blob in blobs.items():
+        try:
+            results[label] = safe_load(blob, policy, key)
+        except Exception as exc:
+            results[label] = exc
+    return results
